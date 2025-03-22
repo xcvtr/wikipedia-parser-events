@@ -2,6 +2,72 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
+import concurrent.futures
+import functools
+from urllib.parse import urlparse
+import os
+import pickle
+import time
+
+# Кэш для запросов
+request_cache = {}
+CACHE_DIR = 'cache'
+CACHE_EXPIRY = 3600  # 1 час
+
+# Компилируем регулярные выражения один раз
+YEAR_PATTERN = re.compile(r'\b(1\d{3}|20[0-2]\d)\b')
+DATE_PATTERNS = [
+    re.compile(r'\b(1\d{3}|20[0-2]\d)\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\b'),
+    re.compile(r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+(1\d{3}|20[0-2]\d)\b')
+]
+DEATH_PATTERNS = [
+    re.compile(r'(\d+(?:,\d+)?)\s+deaths?'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+killed'),
+    re.compile(r'(\d+(?:,\d+)?)\s+casualties'),
+    re.compile(r'(\d+(?:,\d+)?)\s+fatalities'),
+    re.compile(r'(\d+(?:,\d+)?)\s+dead'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+died'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+perished'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+lost\s+their\s+lives'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+were\s+killed'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+were\s+dead'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+were\s+found\s+dead'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+were\s+reported\s+dead'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+were\s+confirmed\s+dead'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+were\s+pronounced\s+dead'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+were\s+declared\s+dead'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+were\s+believed\s+to\s+have\s+died'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+were\s+thought\s+to\s+have\s+died'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+were\s+presumed\s+dead'),
+    re.compile(r'(\d+(?:,\d+)?)\s+people\s+were\s+missing\s+and\s+presumed\s+dead')
+]
+NUMBERS_PATTERN = re.compile(r'\d+(?:,\d+)?')
+
+def setup_cache():
+    """Создает директорию для кэша если её нет"""
+    if not os.path.exists(CACHE_DIR):
+        os.makedirs(CACHE_DIR)
+
+def get_cached_response(url):
+    """Получает ответ из кэша или делает новый запрос"""
+    cache_file = os.path.join(CACHE_DIR, urlparse(url).path.replace('/', '_') + '.cache')
+    
+    if os.path.exists(cache_file):
+        with open(cache_file, 'rb') as f:
+            cached_data = pickle.load(f)
+            if time.time() - cached_data['timestamp'] < CACHE_EXPIRY:
+                return cached_data['content']
+    
+    response = requests.get(url)
+    content = response.content
+    
+    with open(cache_file, 'wb') as f:
+        pickle.dump({
+            'content': content,
+            'timestamp': time.time()
+        }, f)
+    
+    return content
 
 def clean_disaster_type(url):
     """Очищает и форматирует тип катастрофы из URL"""
@@ -29,18 +95,11 @@ def clean_text(text):
 
 def is_year(text):
     """Проверяет, содержит ли текст год"""
-    # Ищем 4 цифры подряд в диапазоне 1000-2100
-    years = re.findall(r'\b(1\d{3}|20[0-2]\d)\b', str(text))
-    return bool(years)
+    return bool(YEAR_PATTERN.search(str(text)))
 
 def is_date(text):
     """Проверяет, является ли текст датой"""
-    # Проверяем форматы даты: "YYYY Month DD" или "Month DD, YYYY"
-    date_patterns = [
-        r'\b(1\d{3}|20[0-2]\d)\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\b',
-        r'\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+(1\d{3}|20[0-2]\d)\b'
-    ]
-    return any(re.search(pattern, str(text)) for pattern in date_patterns)
+    return any(pattern.search(str(text)) for pattern in DATE_PATTERNS)
 
 def is_death_toll(text):
     """Проверяет, является ли текст количеством жертв"""
@@ -54,24 +113,16 @@ def is_death_toll(text):
     
     # Проверяем форматы количества жертв
     death_patterns = [
-        # Простое число: "123"
         r'^\d+$',
-        # Число с запятыми: "1,234"
         r'^\d{1,3}(,\d{3})*$',
-        # Диапазон: "1,234-5,678" или "100-200"
         r'^\d{1,3}(,\d{3})*-\d{1,3}(,\d{3})*$',
         r'^\d+-\d+$',
-        # Приблизительное количество: "~100", "c. 200"
         r'^[~c\. ]*\d+$',
-        # Более/менее: ">100", "<200"
         r'^[<>]\s*\d+$'
     ]
     
-    # Проверяем каждый паттерн
     for pattern in death_patterns:
         if re.match(pattern, text):
-            # Дополнительная проверка: если число похоже на год (1800-2024),
-            # это вероятно дата
             numbers = re.findall(r'\d+', text)
             if numbers and all(1800 <= int(n) <= 2024 for n in numbers):
                 return False
@@ -130,23 +181,36 @@ def determine_event_type(event_name, details):
     """Определяет тип и подтип события на основе его описания"""
     event_text = f"{event_name} {details}".lower()
     
-    # Определяем основной тип (nature или technological)
+    # Определяем основной тип (nature, human_accident или human_deliberate)
     nature_keywords = ['earthquake', 'tsunami', 'flood', 'hurricane', 'tornado', 'storm', 
                       'volcano', 'avalanche', 'landslide', 'drought', 'famine', 'pandemic',
                       'epidemic', 'wildfire', 'cyclone', 'typhoon', 'blizzard', 'heat wave',
                       'cold wave', 'frost', 'hail', 'snow', 'rain', 'natural']
     
-    tech_keywords = ['explosion', 'fire', 'crash', 'collision', 'derailment', 'sinking',
-                    'crush', 'stampede', 'terrorist', 'terrorism', 'bombing', 'shooting',
-                    'massacre', 'industrial', 'mining', 'chemical', 'nuclear', 'radiation',
-                    'leak', 'spill', 'accident', 'disaster', 'man-made']
+    deliberate_keywords = ['terrorist', 'terrorism', 'bombing', 'massacre', 'mass shooting',
+                         'arson', 'sabotage', 'attack', 'assassination', 'genocide',
+                         'war crime', 'ethnic cleansing', 'deliberate', 'intentional',
+                         'planned', 'premeditated', 'murder']
+    
+    accident_keywords = ['explosion', 'fire', 'crash', 'collision', 'derailment', 'sinking',
+                      'crush', 'stampede', 'industrial', 'mining', 'chemical', 'nuclear',
+                      'radiation', 'leak', 'spill', 'accident', 'disaster', 'man-made']
     
     # Определяем основной тип
-    event_type = 'technological'
-    for keyword in nature_keywords:
+    event_type = 'human_accident'  # По умолчанию
+    
+    # Сначала проверяем на преднамеренные действия
+    for keyword in deliberate_keywords:
         if keyword in event_text:
-            event_type = 'nature'
+            event_type = 'human_deliberate'
             break
+    
+    # Если это не преднамеренное действие, проверяем природные причины
+    if event_type == 'human_accident':
+        for keyword in nature_keywords:
+            if keyword in event_text:
+                event_type = 'nature'
+                break
     
     # Определяем подтип
     subtype = 'other'
@@ -182,7 +246,20 @@ def determine_event_type(event_name, details):
         elif any(word in event_text for word in ['cold wave', 'coldwave', 'frost']):
             subtype = 'cold_wave'
     
-    # Техногенные катастрофы
+    # Преднамеренные действия человека
+    elif event_type == 'human_deliberate':
+        if any(word in event_text for word in ['terrorist', 'terrorism', 'bombing', 'bomb']):
+            subtype = 'terrorism'
+        elif any(word in event_text for word in ['shooting', 'massacre', 'mass killing']):
+            subtype = 'mass_shooting'
+        elif any(word in event_text for word in ['arson', 'deliberate fire']):
+            subtype = 'arson'
+        elif any(word in event_text for word in ['sabotage', 'vandalism']):
+            subtype = 'sabotage'
+        elif any(word in event_text for word in ['genocide', 'ethnic cleansing']):
+            subtype = 'genocide'
+    
+    # Техногенные катастрофы (случайные)
     else:
         if any(word in event_text for word in ['explosion', 'blast']):
             subtype = 'explosion'
@@ -196,10 +273,6 @@ def determine_event_type(event_name, details):
             subtype = 'maritime_accident'
         elif any(word in event_text for word in ['crush', 'stampede', 'crowd']):
             subtype = 'crowd_crush'
-        elif any(word in event_text for word in ['terrorist', 'terrorism', 'bombing', 'bomb']):
-            subtype = 'terrorism'
-        elif any(word in event_text for word in ['shooting', 'massacre', 'mass killing']):
-            subtype = 'mass_shooting'
         elif any(word in event_text for word in ['industrial', 'factory']):
             subtype = 'industrial_accident'
         elif any(word in event_text for word in ['mining', 'mine']):
@@ -467,6 +540,18 @@ def extract_links_from_text(soup):
     # Находим все параграфы с текстом
     paragraphs = soup.find_all('p')
     
+    # Расширенный список ключевых слов
+    keywords = [
+        'disaster', 'accident', 'incident', 'explosion', 'fire', 'crash',
+        'sinking', 'collision', 'derailment', 'flood', 'earthquake', 'tsunami',
+        'storm', 'hurricane', 'tornado', 'avalanche', 'landslide', 'drought',
+        'famine', 'pandemic', 'epidemic', 'wildfire', 'blizzard', 'heat wave',
+        'cold wave', 'frost', 'hail', 'snow', 'rain', 'natural', 'industrial',
+        'mining', 'chemical', 'nuclear', 'radiation', 'leak', 'spill', 'contamination',
+        'environmental', 'pollution', 'toxic', 'poison', 'massacre', 'shooting',
+        'terrorist', 'terrorism', 'bombing', 'bomb', 'mass killing'
+    ]
+    
     for p in paragraphs:
         # Ищем ссылки в параграфе
         links = p.find_all('a')
@@ -487,9 +572,9 @@ def extract_links_from_text(soup):
                     details += next_text.strip() + " "
                 next_text = next_text.next_sibling
             
-            # Если нашли событие
-            if event_name and any(keyword in event_name.lower() for keyword in 
-                               ['disaster', 'accident', 'incident', 'explosion', 'fire', 'crash']):
+            # Проверяем текст ссылки и детали на наличие ключевых слов
+            text_to_check = f"{event_name} {details}".lower()
+            if any(keyword in text_to_check for keyword in keywords):
                 event_data = {
                     'Death toll': "Unknown",
                     'Event': create_short_event_name(event_name, details),
@@ -515,40 +600,185 @@ def extract_links_from_text(soup):
     
     return events
 
-def parse_page(url):
-    """Парсит страницу с катастрофами"""
+def parse_environmental_disasters(soup):
+    """Парсит страницу с экологическими катастрофами"""
+    events = []
+    
+    # Находим все заголовки категорий (h2)
+    categories = soup.find_all('h2')
+    print(f"Найдено категорий: {len(categories)}")
+    
+    # Расширенный список ключевых слов для экологических катастроф
+    env_keywords = {
+        # Общие термины
+        'oil spill', 'chemical spill', 'toxic waste', 'pollution', 'contamination',
+        'environmental disaster', 'ecological disaster', 'environmental damage',
+        'environmental impact', 'environmental catastrophe', 'environmental crisis',
+        'environmental emergency', 'environmental incident', 'environmental accident',
+        'environmental contamination', 'environmental pollution', 'environmental hazard',
+        'environmental risk', 'environmental threat', 'environmental problem',
+        'environmental issue', 'environmental concern', 'environmental damage',
+        'environmental destruction', 'environmental degradation', 'environmental harm',
+        'environmental injury', 'environmental impairment', 'environmental detriment',
+        
+        # Специфические типы загрязнений
+        'water pollution', 'air pollution', 'soil pollution', 'groundwater pollution',
+        'marine pollution', 'ocean pollution', 'river pollution', 'lake pollution',
+        'industrial pollution', 'agricultural pollution', 'urban pollution',
+        
+        # Химические вещества
+        'mercury', 'lead', 'arsenic', 'cadmium', 'chromium', 'pesticides',
+        'herbicides', 'fertilizers', 'heavy metals', 'toxic chemicals',
+        
+        # Источники загрязнения
+        'mining waste', 'industrial waste', 'nuclear waste', 'radioactive waste',
+        'sewage', 'wastewater', 'effluent', 'emissions', 'discharge',
+        
+        # Последствия
+        'ecosystem damage', 'biodiversity loss', 'habitat destruction',
+        'species extinction', 'deforestation', 'desertification',
+        'climate change', 'global warming', 'ozone depletion'
+    }
+    
+    # Создаем множество для быстрого поиска
+    env_keywords_set = set(env_keywords)
+    
+    for category in categories:
+        category_name = category.text.strip()
+        if not category_name or category_name in ['Contents', 'See also', 'References']:
+            continue
+            
+        print(f"\nОбработка категории: {category_name}")
+        
+        # Получаем следующий ul после заголовка
+        ul = category.find_next('ul')
+        if not ul:
+            print(f"Предупреждение: Не найден список для категории {category_name}")
+            continue
+            
+        # Парсим все li элементы
+        items = ul.find_all('li')
+        print(f"Найдено элементов: {len(items)}")
+        
+        for li in items:
+            text = clean_text_cached(li.text)
+            if not text:
+                continue
+                
+            # Ищем ссылку в li
+            link = li.find('a')
+            if not link:
+                print(f"Предупреждение: Не найдена ссылка в элементе: {text[:50]}...")
+                continue
+                
+            href = link.get('href')
+            if not href or not href.startswith('/wiki/'):
+                print(f"Предупреждение: Неверный формат ссылки: {href}")
+                continue
+                
+            event_name = clean_text_cached(link.text)
+            details = text.replace(event_name, '').strip()
+            
+            # Проверяем, является ли это экологической катастрофой
+            text_to_check = f"{event_name} {details}".lower()
+            if not any(keyword in text_to_check for keyword in env_keywords_set):
+                print(f"Пропуск: Не найдены ключевые слова в тексте: {text[:50]}...")
+                continue
+            
+            print(f"Обработка события: {event_name}")
+            
+            # Создаем данные события
+            event_data = {
+                'Death toll': "Unknown",
+                'Event': create_short_event_name(event_name, details),
+                'City': "Unknown",
+                'Country': "Unknown",
+                'Date': "Unknown",
+                'Details': details,
+                'Event Type': "human_accident",
+                'Event Subtype': "environmental_disaster",
+                'URL': f"https://en.wikipedia.org{href}"
+            }
+            
+            # Извлекаем город и страну
+            event_data['City'] = extract_city("", event_name, details)
+            event_data['Country'] = determine_country("", event_name, details)
+            
+            # Ищем дату
+            for pattern in DATE_PATTERNS:
+                match = pattern.search(text)
+                if match:
+                    if len(match.group(0).split()) == 1:  # Только год
+                        event_data['Date'] = f"{match.group(0)}-01-01"
+                    else:  # Полная дата
+                        event_data['Date'] = format_date(match.group(0))
+                    print(f"Найдена дата: {event_data['Date']}")
+                    break
+            
+            # Ищем количество жертв
+            for pattern in DEATH_PATTERNS:
+                match = pattern.search(text)
+                if match:
+                    event_data['Death toll'] = match.group(1)
+                    print(f"Найдено количество жертв: {event_data['Death toll']}")
+                    break
+            
+            # Если количество жертв не найдено, проверяем на наличие числовых данных
+            if event_data['Death toll'] == "Unknown":
+                numbers = NUMBERS_PATTERN.findall(text)
+                for num in numbers:
+                    if 1 <= int(num.replace(',', '')) <= 1000000:  # Разумный диапазон
+                        event_data['Death toll'] = num
+                        print(f"Найдено количество жертв из числовых данных: {event_data['Death toll']}")
+                        break
+            
+            events.append(event_data)
+            print(f"Событие добавлено: {event_data['Event']}")
+    
+    print(f"\nВсего извлечено событий: {len(events)}")
+    return events
+
+def parse_page_parallel(url):
+    """Версия parse_page для параллельной обработки"""
     try:
-        response = requests.get(url)
-        soup = BeautifulSoup(response.content, 'html.parser')
+        print(f"\nОбработка страницы: {url}")
+        content = get_cached_response(url)
+        soup = BeautifulSoup(content, 'html.parser')
         
-        # Находим все таблицы на странице
+        if 'List_of_environmental_disasters' in url:
+            print("Обнаружена страница экологических катастроф, применяю специальный парсер")
+            events = parse_environmental_disasters(soup)
+            if not events:
+                print("Предупреждение: Не удалось извлечь события со страницы экологических катастроф")
+            return events
+        
         tables = soup.find_all('table', {'class': 'wikitable'})
-        
         all_events = []
         
         if tables:
-            # Парсим таблицы
+            print(f"Найдено таблиц: {len(tables)}")
             disaster_type = clean_disaster_type(url)
             for table in tables:
                 events = parse_table(table, disaster_type)
                 for event in events:
                     event['URL'] = url
-                    # Если страна не определена, пытаемся определить её из URL
                     if event['Country'] == "Unknown":
                         country = extract_country_from_url(url)
                         if country:
                             event['Country'] = country
                 all_events.extend(events)
         else:
-            # Парсим ссылки из текста
+            print("Таблицы не найдены, пытаюсь извлечь события из текста")
             events = extract_links_from_text(soup)
             for event in events:
-                # Если страна не определена, пытаемся определить её из URL
                 if event['Country'] == "Unknown":
                     country = extract_country_from_url(url)
                     if country:
                         event['Country'] = country
             all_events.extend(events)
+        
+        if not all_events:
+            print("Предупреждение: Не удалось извлечь события со страницы")
         
         return all_events
     
@@ -594,7 +824,8 @@ def parse_table(table, disaster_type):
                     break
     
     # Парсим строки таблицы
-    for row in table.find_all('tr')[1:]:
+    rows = table.find_all('tr')[1:]
+    for row in rows:
         cols = row.find_all(['td', 'th'])
         if len(cols) >= len(headers):
             event_data = {
@@ -627,7 +858,6 @@ def parse_table(table, disaster_type):
                         event_data['City'] = extract_city(value, event_data['Event'], event_data['Details'])
                         event_data['Country'] = determine_country(value, event_data['Event'], event_data['Details'])
                     elif field == 'event':
-                        # Если название длинное, переносим его в Details
                         if len(value) > 50:
                             event_data['Details'] = value
                             event_data['Event'] = create_short_event_name(value, "")
@@ -643,7 +873,6 @@ def parse_table(table, disaster_type):
             
             # Проверяем корректность данных
             if event_data['Death toll'] != "Unknown" and not is_date(event_data['Death toll']):
-                # Если страна не определена, пытаемся определить её из URL
                 if event_data['Country'] == "Unknown":
                     event_data['Country'] = determine_country("", "", "", disaster_type)
                 events.append(event_data)
@@ -651,44 +880,49 @@ def parse_table(table, disaster_type):
     return events
 
 def main():
-    # URL главной страницы со списком катастроф
+    setup_cache()
     main_url = "https://en.wikipedia.org/wiki/Lists_of_disasters"
     
     try:
-        response = requests.get(main_url)
-        soup = BeautifulSoup(response.content, 'html.parser')
+        content = get_cached_response(main_url)
+        soup = BeautifulSoup(content, 'html.parser')
         
-        # Находим все ссылки на списки катастроф
+        # Собираем все ссылки
         disaster_links = []
+        env_disaster_url = "https://en.wikipedia.org/wiki/List_of_environmental_disasters"
+        
         for link in soup.find_all('a'):
             href = link.get('href')
             if href and 'List_of_' in href and 'disaster' in href.lower():
                 full_url = f"https://en.wikipedia.org{href}"
-                disaster_links.append(full_url)
+                if full_url != env_disaster_url:
+                    disaster_links.append(full_url)
         
-        # Удаляем дубликаты
         disaster_links = list(set(disaster_links))
         
+        # Добавляем URL экологических катастроф первым
+        disaster_links.insert(0, env_disaster_url)
+        
+        # Параллельная обработка страниц
         all_events = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_url = {executor.submit(parse_page_parallel, url): url for url in disaster_links}
+            for future in concurrent.futures.as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    events = future.result()
+                    all_events.extend(events)
+                except Exception as e:
+                    print(f"Ошибка при обработке {url}: {str(e)}")
         
-        # Парсим каждую страницу
-        for url in disaster_links:
-            print(f"Парсинг страницы: {url}")
-            events = parse_page(url)
-            all_events.extend(events)
-        
-        # Создаем DataFrame
+        # Создаем DataFrame и сохраняем результаты
         df = pd.DataFrame(all_events)
-        
-        # Удаляем дубликаты и пустые строки
         df = df.drop_duplicates()
         df = df[df['Death toll'] != 'Unknown']
         
-        # Удаляем колонку Type
         if 'Type' in df.columns:
             df = df.drop('Type', axis=1)
         
-        # Сохраняем результаты в CSV
         df.to_csv('disasters.csv', index=False, encoding='utf-8')
         print("\nДанные успешно сохранены в файл 'disasters.csv'")
         
@@ -718,7 +952,7 @@ def main():
             print("-" * 80)
             
     except Exception as e:
-        print(f"Произошла ошибка: {str(e)}")
+        print(f"Ошибка при парсинге: {str(e)}")
 
 if __name__ == "__main__":
     main() 
