@@ -42,9 +42,13 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Файлы проекта
+# Project files
 disasters.csv
 backups/
+cache/
+
+# Cache files
+*.cache
 
 # Системные файлы
 .DS_Store
