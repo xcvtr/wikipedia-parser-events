@@ -4,7 +4,6 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
 build/
 develop-eggs/
 dist/
@@ -21,8 +20,9 @@ wheels/
 .installed.cfg
 *.egg
 
-# Виртуальное окружение
+# Virtual Environment
 venv/
+env/
 ENV/
 
 # IDE
@@ -31,10 +31,20 @@ ENV/
 *.swp
 *.swo
 
+# Logs
+*.log
+
+# Local development settings
+.env
+.env.local
+
+# System files
+.DS_Store
+Thumbs.db
+
 # Файлы проекта
 disasters.csv
 backups/
-*.log
 
 # Системные файлы
 .DS_Store
