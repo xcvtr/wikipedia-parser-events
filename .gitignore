@@ -33,6 +33,7 @@ ENV/
 
 # Logs
 *.log
+logs/
 
 # Local development settings
 .env
